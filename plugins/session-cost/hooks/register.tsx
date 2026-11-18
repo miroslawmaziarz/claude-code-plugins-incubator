@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CompareSelection, CostView, DayMap, DrillTarget, RequestKind, RequestRow, SavedRequest, SessionNames, SessionRollup, SessionSummary, Tokens } from '../types'
+import type { AgentMeta, CompareSelection, CostView, DayMap, DrillTarget, RequestKind, RequestRow, SavedRequest, SessionNames, SessionRollup, SessionSummary, Tokens } from '../types'
 import {
   addOtherToDays,
   addRowToDays,
@@ -15,14 +15,14 @@ import {
   summaryDays,
   sumDays,
 } from './days'
-import { CACHE_READ_RAMP, CACHE_WRITE_RAMP, clockTime, count, duration, durationBar, heatColor, heatLevel, oneLine, padEnd, padStart, percent, shortModel, stamp, toolList, usd } from './format'
+import { CACHE_READ_RAMP, CACHE_WRITE_RAMP, clockTime, count, duration, durationBar, heatColor, heatLevel, oneLine, padEnd, padStart, percent, shortId, shortModel, stamp, toolList, usd } from './format'
 import { EMPTY_LEDGER, addRow, appendRow, applyLedger, cacheHit, emptyTotals, sessionSpend, tokenSum } from './ledger'
 import { estimate } from './pricing'
 import { sessionName, titlesIn } from './names'
 import { cell, compareSessions, delta, resolveSession, splitArgs } from './compare'
 import { UNKNOWN_AGENT_TYPE, addRowToRollup, addSharesToRollup, emptyRollup, rollupFromRows, rollupRequests, setAgentMeta } from './rollup'
 import { manifestVersion } from './version'
-import { agentTree, ancestry, mainOwn, rollupTotal, savedRows } from './drill'
+import { agentTree, ancestry, mainOwn, rollupTotal, savedRows, subtreeTotal } from './drill'
 
 const PLUGIN = 'session-cost'
 const PANE = 'session-cost'
@@ -74,7 +74,7 @@ async function ledgerUsd($: Engine): Promise<number | undefined> {
 }
 
 /** What a subagent the mod did not see spawned was started as, from the engine's list of agents. */
-async function lookupAgent($: Engine, id: string): Promise<{ type: string; parentId?: string }> {
+async function lookupAgent($: Engine, id: string): Promise<AgentMeta> {
   try {
     const found = (await $.agent.list()).find(a => a.id === id)
     if (found) return { type: found.type, ...(found.parentId === undefined ? {} : { parentId: found.parentId }) }
@@ -169,7 +169,8 @@ async function liveSummary($: Engine, n: SessionNames): Promise<SessionSummary |
 async function saveSummary($: Engine, sessionId?: string): Promise<void> {
   try {
     await serial(async () => {
-      const summary = await liveSummary($, await scanTitles($))
+      const n = sessionId === undefined ? await scanTitles($) : await scanEndingTitles($, sessionId)
+      const summary = await liveSummary($, n)
       if (summary === undefined) return
       const id = sessionId ?? (await $.session.id())
       await $.store.set(STORE_PREFIX + id, summary)
@@ -179,22 +180,43 @@ async function saveSummary($: Engine, sessionId?: string): Promise<void> {
   }
 }
 
-/** Reads what the transcript added since the last scan for the session's titles; reads nothing else of it. */
-async function scanTitles($: Engine): Promise<SessionNames> {
+/**
+ * Reads what the transcript (`path`, else the session's current one) added since the last scan
+ * for the session's titles; reads nothing else of it. An offset counts bytes of the file it was
+ * taken in, so another file is read from its head.
+ */
+async function scanTitles($: Engine, path?: string): Promise<SessionNames> {
   const n = (await read($, names)) ?? {}
   try {
-    const path = (await $.session.info()).transcriptPath
-    if (path === '') return n
-    const { size } = await $.fs.stat(path)
-    const from = Math.max(n.scanned !== undefined && n.scanned <= size ? n.scanned : 0, size - TITLE_SCAN_BYTES)
+    const file = path ?? (await $.session.info()).transcriptPath
+    if (file === '') return n
+    const { size } = await $.fs.stat(file)
+    const scanned = n.transcript === file && n.scanned !== undefined && n.scanned <= size ? n.scanned : 0
+    const from = Math.max(scanned, size - TITLE_SCAN_BYTES)
     if (from >= size) return n
-    const found = titlesIn(await $.fs.read(path, { offset: from, length: size - from }))
-    const next = { ...n, ...found, scanned: size }
+    const found = titlesIn(await $.fs.read(file, { offset: from, length: size - from }))
+    const next = { ...n, ...found, transcript: file, scanned: size }
     await update($, names, () => next)
     return next
   } catch {
     // No transcript, or none the mod may read: the first prompt names the session.
     return n
+  }
+}
+
+/**
+ * The titles of a session that is ending. After a `/clear` the engine may already name the new
+ * conversation's transcript, so read the file named for the ending session, else the one its
+ * scans read; with neither, keep the names as they are.
+ */
+async function scanEndingTitles($: Engine, sessionId: string): Promise<SessionNames> {
+  try {
+    const current = (await $.session.info()).transcriptPath
+    if (current !== '' && current.includes(sessionId)) return await scanTitles($, current)
+    const n = (await read($, names)) ?? {}
+    return n.transcript === undefined ? n : await scanTitles($, n.transcript)
+  } catch {
+    return (await read($, names)) ?? {}
   }
 }
 
@@ -218,6 +240,28 @@ async function comparable($: Engine): Promise<{ sessions: Saved[]; currentId: st
   const live = await liveSummary($, n ?? {})
   const others = history.filter(s => s.id !== currentId)
   return { sessions: live ? [...others, { id: currentId, ...live }] : others, currentId }
+}
+
+/**
+ * One session as the details and Compare views show it: this one from its live state, any other
+ * from its saved entry alone, so drawing a view does not load every saved session.
+ */
+async function sessionById($: Engine, id: string, currentId: string): Promise<Saved | undefined> {
+  if (id === currentId) {
+    const live = await liveSummary($, (await read($, names)) ?? {})
+    return live && { id, ...live }
+  }
+  try {
+    const saved = (await $.store.get(STORE_PREFIX + id)) as SessionSummary | undefined
+    return saved && typeof saved.lastAt === 'number' ? { id, ...saved } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** What a History row's pick button shows: `A` or `B` when the session is marked so, else `·`. */
+function pickMark(sel: CompareSelection, id: string): string {
+  return sel.a === id ? 'A' : sel.b === id ? 'B' : '·'
 }
 
 /** Picks a session as A, or as B once A is picked; answers whether that completed a pair. */
@@ -299,6 +343,8 @@ async function reset($: Engine): Promise<void> {
     await update($, totals, () => emptyTotals())
     await update($, days, () => ({}))
     await update($, rollup, () => emptyRollup())
+    // The name goes too, or the next save would write it back into the history entry just dropped.
+    await update($, names, () => ({}))
     await update($, ledger, () => ({ lastUsd: now, sessionUsd: now, pending: [], resetUsd: now }))
     // Drop the session's saved summary too, or its pre-reset spend would still count in History.
     try {
@@ -319,7 +365,7 @@ type Elements = ReturnType<Engine['ui']['resolve']>
 
 /** The details view: a session's summary, its subagent tree and its requests, or the same for one subagent in it. */
 async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
-  const [d, currentId, liveRows, { sessions }] = await Promise.all([read($, drill), $.session.id(), read($, requests), comparable($)])
+  const [d, currentId, liveRows] = await Promise.all([read($, drill), $.session.id(), read($, requests)])
   const backButton = (
     <Box flexDirection="row">
       <Button key="drill:back" hotkey="b" onPress={() => back($)}>
@@ -327,7 +373,7 @@ async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
       </Button>
     </Box>
   )
-  const s = sessions.find(x => x.id === d?.id)
+  const s = d ? await sessionById($, d.id, currentId) : undefined
   if (!d || !s) {
     return (
       <Box flexDirection="column">
@@ -342,11 +388,14 @@ async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
   const path = r ? d.path.filter(id => r.byAgent[id] !== undefined) : []
   const at = path.at(-1)
   const agent = r && at !== undefined ? r.byAgent[at] : undefined
-  const crumbs = r ? path.map(id => ` › ${r.byAgent[id]?.type ?? UNKNOWN_AGENT_TYPE} ${id.slice(0, 8)}`).join('') : ''
-  const node = agent ?? { ...s, durationMs: r?.durationMs ?? 0 }
-  const spent = agent ? agent.ledgerUsd : s.ledgerUsd
-  const own = (rows ?? []).filter(x => at === undefined || x.agentId === at)
-  const who = (x: SavedRequest) =>
+  const crumbs = r ? path.map(id => ` › ${r.byAgent[id]?.type ?? UNKNOWN_AGENT_TYPE} ${shortId(id)}`).join('') : ''
+  const tree = r ? agentTree(r, at) : []
+  // A subagent's details count it and every subagent under it, as the session's count them all.
+  const node = r && agent && at !== undefined ? subtreeTotal(r, at) : { ...s, durationMs: r?.durationMs ?? 0 }
+  const spent = agent ? node.ledgerUsd : s.ledgerUsd
+  const inView = at === undefined ? undefined : new Set([at, ...tree.map(n => n.id)])
+  const own = (rows ?? []).filter(x => inView === undefined || (x.agentId !== undefined && inView.has(x.agentId)))
+  const rowSource = (x: SavedRequest) =>
     x.agentId === undefined ? (x.kind === 'compact' ? 'compact' : 'main') : `${r?.byAgent[x.agentId]?.type ?? 'sub'}${x.kind === 'compact' ? ' compact' : ''}`
   const label = (text: string) => padEnd(text, 28)
   const share = (b: { ledgerUsd: number; requests: number }) => `${padStart(usd(b.ledgerUsd), 9)} ${padStart(String(b.requests), 4)} req`
@@ -357,7 +406,7 @@ async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
       {backButton}
       <Box flexDirection="column">
         <Text wrap="truncate-end" weight="bold">
-          Session {s.id.slice(0, 8)}
+          Session {shortId(s.id)}
           {s.name ? `  ${s.name}` : ''}
           {crumbs}
         </Text>
@@ -375,18 +424,16 @@ async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
       </Box>
       {r ? (
         <Box flexDirection="column">
-          <Text weight="bold">{at === undefined ? 'Main and subagents' : 'Subagents'}</Text>
-          {at === undefined ? (
-            <Text wrap="truncate-end" tabular>
-              {label('main')} {share(mainOwn(r))}
-            </Text>
-          ) : null}
-          {agentTree(r, at).map(n => (
+          <Text weight="bold">{at === undefined ? 'Main and subagents' : 'Itself and subagents'}</Text>
+          {/* What the main loop, or the subagent shown, spent itself; with the lines below it makes the total. */}
+          <Text wrap="truncate-end" tabular>
+            {label(agent ? `${agent.type} own` : 'main')} {share(agent ?? mainOwn(r))}
+          </Text>
+          {tree.map(n => (
             <Button key={`agent:${n.id}`} plain onPress={() => update($, drill, () => ({ id: s.id, path: ancestry(r, n.id) }))}>
-              {`${label(`${'  '.repeat(n.depth - 1)}└ ${n.agent.type} ${n.id.slice(0, 8)}`)} ${share(n.agent)}`}
+              {`${label(`${'  '.repeat(n.depth - 1)}└ ${n.agent.type} ${shortId(n.id)}`)} ${share(n.agent)}`}
             </Button>
           ))}
-          {at !== undefined && agentTree(r, at).length === 0 ? <Text dimColor>none</Text> : null}
           {Math.abs(unattributed) >= 0.00005 ? (
             <Text wrap="truncate-end" dimColor tabular>
               {label('unattributed')} {padStart(usd(unattributed), 9)}
@@ -400,7 +447,7 @@ async function sessionDetails($: Engine, { Box, Text, Button }: Elements) {
         <Text weight="bold">Requests</Text>
         {own.map(x => (
           <Text key={`drill:req:${x.seq}`} wrap="truncate-end" tabular>
-            #{x.seq} <Text dimColor>{clockTime(x.at)}</Text> {shortModel(x.model)} <Text color={x.agentId === undefined ? undefined : 'warning'}>{who(x)}</Text>
+            #{x.seq} <Text dimColor>{clockTime(x.at)}</Text> {shortModel(x.model)} <Text color={x.agentId === undefined ? undefined : 'warning'}>{rowSource(x)}</Text>
             {'  '}in {count(x.input)} out {count(x.output)} cr {count(x.cacheRead)} cw {count(x.cacheWrite)}{'  '}
             <Text color="success">{x.ledgerUsd === null ? '…' : `${x.isApprox ? '~' : ''}${usd(x.ledgerUsd)}`}</Text>
             <Text dimColor> / est {usd(x.estUsd)}</Text>
@@ -598,7 +645,8 @@ export const register: Register = (on, options) => {
       const found = words.slice(1).map(w => resolveSession(sessions, w))
       const errors = found.flatMap(f => ('error' in f ? [f.error] : []))
       if (errors.length > 0) return { text: `Session cost: ${errors.join('; ')}.` }
-      const [a, b] = found.map(f => ('id' in f ? f.id : ''))
+      const [a = '', b = ''] = found.map(f => ('id' in f ? f.id : ''))
+      if (a === b) return { text: `Session cost: "${words[1]}" and "${words[2]}" both name session ${shortId(a)}; pick two different sessions.` }
       await update($, compare, () => ({ a, b }))
       await update($, view, () => 'compare')
       const opened = await $.ui.open({ id: PANE, title: TITLE })
@@ -803,31 +851,29 @@ export const register: Register = (on, options) => {
     } else if (mode === 'session') {
       body = await sessionDetails($, $.ui.resolve(e))
     } else if (mode === 'compare') {
-      const sel = (await read($, compare)) ?? {}
-      const { sessions } = await comparable($)
-      const find = (id?: string) => (id === undefined ? undefined : sessions.find(s => s.id === id))
-      const a = find(sel.a)
-      const b = find(sel.b)
-      const who = (side: 'A' | 'B', s: Saved | undefined, id: string | undefined) => (
+      const [sel = {}, currentId] = await Promise.all([read($, compare), $.session.id()])
+      const find = (id?: string) => (id === undefined ? undefined : sessionById($, id, currentId))
+      const [a, b] = await Promise.all([find(sel.a), find(sel.b)])
+      const sideRow = (side: 'A' | 'B', s: Saved | undefined, id: string | undefined) => (
         <Text key={`cmp:who:${side}`} wrap="truncate-end">
           <Text weight="bold">{side} </Text>
-          {s ? `${padEnd(s.id.slice(0, 8), 8)} ${stamp(s.lastAt)}${s.name ? `  ${s.name}` : ''}` : id === undefined ? '—' : `${id.slice(0, 8)} (no longer saved)`}
+          {s ? `${padEnd(shortId(s.id), 8)} ${stamp(s.lastAt)}${s.name ? `  ${s.name}` : ''}` : id === undefined ? '—' : `${shortId(id)} (no longer saved)`}
         </Text>
       )
       const COL = 10
       body =
         !a || !b ? (
           <Box flexDirection="column">
-            {who('A', a, sel.a)}
-            {who('B', b, sel.b)}
+            {sideRow('A', a, sel.a)}
+            {sideRow('B', b, sel.b)}
             <Text dimColor>—</Text>
             <Text dimColor>Pick two sessions in History (A, then B), or run /session-cost compare A B.</Text>
           </Box>
         ) : (
           <Box flexDirection="column" gap={1}>
             <Box flexDirection="column">
-              {who('A', a, sel.a)}
-              {who('B', b, sel.b)}
+              {sideRow('A', a, sel.a)}
+              {sideRow('B', b, sel.b)}
               <Box flexDirection="row">
                 <Button key="compare:swap" hotkey="s" onPress={() => update($, compare, old => ({ a: old?.b, b: old?.a }))}>
                   swap
@@ -889,7 +935,7 @@ export const register: Register = (on, options) => {
             <Box flexDirection="row" gap={1}>
               {t.requests > 0 ? (
                 <Button key={`pick:${currentId}`} plain onPress={() => pick($, currentId)}>
-                  {sel.a === currentId ? 'A' : sel.b === currentId ? 'B' : '·'}
+                  {pickMark(sel, currentId)}
                 </Button>
               ) : null}
               {t.requests > 0 ? (
@@ -908,13 +954,13 @@ export const register: Register = (on, options) => {
                 {recent.map(s => (
                   <Box key={`sess:${s.id}`} flexDirection="row" gap={1}>
                     <Button key={`pick:${s.id}`} plain onPress={() => pick($, s.id)}>
-                      {sel.a === s.id ? 'A' : sel.b === s.id ? 'B' : '·'}
+                      {pickMark(sel, s.id)}
                     </Button>
                     <Button key={`open:${s.id}`} plain onPress={() => openSession($, s.id)}>
                       ›
                     </Button>
                     <Text wrap="truncate-end" dimColor tabular>
-                      {stamp(s.lastAt)} {padStart(usd(s.ledgerUsd), 9)} {padStart(String(s.requests), 5)} req {s.name ? `${padEnd(s.id.slice(0, 8), 8)}  ${s.name}` : s.id.slice(0, 8)}
+                      {stamp(s.lastAt)} {padStart(usd(s.ledgerUsd), 9)} {padStart(String(s.requests), 5)} req {s.name ? `${padEnd(shortId(s.id), 8)}  ${s.name}` : shortId(s.id)}
                     </Text>
                   </Box>
                 ))}

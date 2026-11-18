@@ -1,7 +1,7 @@
 import type { RollupBucket, SessionRollup, SessionSummary } from '../types'
-import { count, duration, percent, shortModel, usd } from './format'
+import { count, duration, percent, shortId, shortModel, usd } from './format'
 import { cacheHit, tokenSum } from './ledger'
-import { emptyBucket } from './rollup'
+import { addBuckets, emptyBucket } from './rollup'
 
 /** How a metric is written: dollars, a count, a request time, a wall-clock span, or a 0..1 rate. */
 export type Unit = 'usd' | 'count' | 'ms' | 'span' | 'rate'
@@ -78,23 +78,10 @@ function slice(id: string, label: string, a: RollupBucket | null, b: RollupBucke
   ]
 }
 
-function plus(x: RollupBucket, y: RollupBucket): RollupBucket {
-  return {
-    input: x.input + y.input,
-    output: x.output + y.output,
-    cacheRead: x.cacheRead + y.cacheRead,
-    cacheWrite: x.cacheWrite + y.cacheWrite,
-    requests: x.requests + y.requests,
-    estUsd: x.estUsd + y.estUsd,
-    ledgerUsd: x.ledgerUsd + y.ledgerUsd,
-    durationMs: x.durationMs + y.durationMs,
-  }
-}
-
 /** A session's subagents summed by type. */
 export function byAgentType(r: SessionRollup): Record<string, RollupBucket> {
   const out: Record<string, RollupBucket> = {}
-  for (const a of Object.values(r.byAgent)) out[a.type] = plus(out[a.type] ?? emptyBucket(), a)
+  for (const a of Object.values(r.byAgent)) out[a.type] = addBuckets(out[a.type] ?? emptyBucket(), a)
   return out
 }
 
@@ -110,7 +97,8 @@ export function compareSessions(a: SessionSummary, b: SessionSummary): Section[]
   const rb = b.rollup ?? null
   const missing = ra === null && rb === null ? 'A and B' : ra === null ? 'A' : rb === null ? 'B' : undefined
   const withMissing = (s: Section): Section => (missing === undefined ? s : { ...s, missing })
-  const totals: Section = {
+  // Wall clock and request time come from the rollup too, so Totals carries the note as well.
+  const totals = withMissing({
     title: 'Totals',
     metrics: [
       lower('cost', '/cost', a.ledgerUsd, b.ledgerUsd, 'usd'),
@@ -124,7 +112,7 @@ export function compareSessions(a: SessionSummary, b: SessionSummary): Section[]
       lower('wall', 'wall clock', ra && ra.lastAt - ra.firstAt, rb && rb.lastAt - rb.firstAt, 'span'),
       lower('reqTime', 'request time', ra && ra.durationMs, rb && rb.durationMs, 'ms'),
     ],
-  }
+  })
   const kinds = [
     ['main', 'main'],
     ['subagent', 'sub'],
@@ -166,7 +154,7 @@ export function resolveSession(sessions: ReadonlyArray<{ id: string; name?: stri
   const pick = (found: ReadonlyArray<{ id: string }>): { id: string } | { error: string } | undefined => {
     const [first] = found
     if (found.length === 1 && first) return { id: first.id }
-    if (found.length > 1) return { error: `"${query}" matches ${found.length} sessions (${found.slice(0, 3).map(s => s.id.slice(0, 8)).join(', ')}${found.length > 3 ? ', …' : ''}); give more of its id` }
+    if (found.length > 1) return { error: `"${query}" matches ${found.length} sessions (${found.slice(0, 3).map(s => shortId(s.id)).join(', ')}${found.length > 3 ? ', …' : ''}); give more of its id` }
     return undefined
   }
   return (

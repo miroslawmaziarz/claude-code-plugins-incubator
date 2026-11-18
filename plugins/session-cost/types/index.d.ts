@@ -125,13 +125,16 @@ export type RollupBucket = Tokens & {
   durationMs: number
 }
 
-/** One subagent's requests, with what it was spawned as. */
-export type AgentRollup = RollupBucket & {
+/** What a subagent was spawned as. */
+export type AgentMeta = {
   /** Its agent type (`Explore`, `Plan`, ...); `subagent` when the mod did not see it spawned. */
   type: string
   /** The agent that spawned it; absent when the main loop did. */
   parentId?: string
 }
+
+/** One subagent's own requests (not its subagents'), with what it was spawned as. */
+export type AgentRollup = RollupBucket & AgentMeta
 
 /** A session's aggregates, kept for comparing and drilling into it after it ends; no per-request rows. */
 export type SessionRollup = {
@@ -160,7 +163,9 @@ export type SessionNames = {
   custom?: string
   /** The last title Claude Code generated for the session, as the transcript has it. */
   ai?: string
-  /** How many bytes of the transcript have been scanned for titles. */
+  /** The transcript file the titles were read from; `scanned` counts its bytes. */
+  transcript?: string
+  /** How many bytes of that transcript have been scanned for titles. */
   scanned?: number
 }
 

@@ -259,19 +259,71 @@ test('a session without a title is named in Recent sessions by its first prompt'
 
 /** A transcript the test writes to, read by the mod as the engine's file system would. */
 function transcript(on: On) {
-  const file = { path: '/home/u/.claude/projects/p/sess-1.jsonl', text: '' }
+  const dir = '/home/u/.claude/projects/p/'
+  const files: Record<string, string> = { [`${dir}sess-1.jsonl`]: '' }
+  const file = { path: `${dir}sess-1.jsonl` }
   on('session.info', () => ({ value: { transcriptPath: file.path } }))
-  on('fs.stat', (_, e) => (e.path === file.path ? { value: { kind: 'file', size: file.text.length, mtimeMs: 0, isLink: false } } : { deny: 'ENOENT' }))
+  on('fs.stat', (_, e) => (files[e.path] !== undefined ? { value: { kind: 'file', size: files[e.path]!.length, mtimeMs: 0, isLink: false } } : { deny: 'ENOENT' }))
   on('fs.read', (_, e) => {
-    if (e.path !== file.path) return { deny: 'ENOENT' }
+    const text = files[e.path]
+    if (text === undefined) return { deny: 'ENOENT' }
     const from = e.offset ?? 0
-    return { value: file.text.slice(from, e.length === undefined ? undefined : from + e.length) }
+    return { value: text.slice(from, e.length === undefined ? undefined : from + e.length) }
   })
-  const append = (row: object) => {
-    file.text += JSON.stringify(row) + '\n'
+  /** Appends a row to the session's transcript (`id`'s, else the current one). */
+  const append = (row: object, id?: string) => {
+    const path = id === undefined ? file.path : `${dir}${id}.jsonl`
+    files[path] = (files[path] ?? '') + JSON.stringify(row) + '\n'
   }
-  return { file, append }
+  /** Points the session's transcript at `id`'s file, as a /clear does. */
+  const switchTo = (id: string) => {
+    file.path = `${dir}${id}.jsonl`
+    files[file.path] ??= ''
+  }
+  return { file, append, switchTo }
 }
+
+test('after /clear the ended session keeps the titles of its own transcript, and the next one reads its file from the start', async ($, on) => {
+  const { state } = engine(on)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  const { append, switchTo } = transcript(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('first prompt'))
+  await step($, 0)
+  append({ type: 'ai-title', aiTitle: 'Old title' })
+  await done($)
+  // Renamed after its last turn; by the time session.end runs, the transcript path names the new conversation's file.
+  append({ type: 'custom-title', customTitle: 'Renamed old' })
+  append({ type: 'ai-title', aiTitle: 'New title' }, 'sess-2')
+  switchTo('sess-2')
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+
+  state.id = 'sess-2'
+  await $.prompt.submit(typed('second prompt'))
+  await step($, 1)
+  await done($)
+
+  state.id = 'sess-3'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+Renamed old$/)
+  expect(await recentRow($, 'sess-2')).toMatch(/sess-2\s+New title$/)
+})
+
+test('a reset forgets the session\'s name too, so the saved entry does not bring it back', async ($, on) => {
+  const { state, store } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('before the reset'))
+  await step($, 0)
+  await done($)
+  await runCommand($, 'reset')
+  await step($, 1)
+  await done($)
+  expect((store['session:sess-1'] as { name?: string }).name).toBeUndefined()
+
+  await $.prompt.submit(typed('after the reset'))
+  await done($)
+  state.id = 'sess-2'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+after the reset$/)
+})
 
 test('names in Recent sessions start in one column, a long one cut short, and a session with none shows its id alone', async ($, on) => {
   const saved = { startedAt: 0, ledgerUsd: 1, estUsd: 1, requests: 5, input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }
@@ -742,7 +794,8 @@ test('a subagent opens into its own details, and back walks up to its parent, th
 
     await ui.press({ key: 'drill:back' })
     expect((await ui.find({ type: 'Text', text: /^Session sess-1/ }))?.text).toMatch(/› Explore [^›]*$/)
-    expect(await requestSeqs(ui)).toEqual(['#2'])
+    // Its requests and its subagent's, as the session's list holds its subagents' too.
+    expect(await requestSeqs(ui)).toEqual(['#2', '#3'])
     // Its own subagent is listed, one level under it, and can be entered from here too.
     expect((await ui.find({ type: 'Button', key: `agent:${plan}` }))?.text).toMatch(/^└ Plan /)
 
@@ -807,5 +860,67 @@ test('a session saved before 0.6.0 opens with its totals and a note in place of 
   expect((await ui.find({ type: 'Text', text: /^main / }))?.text).toMatch(/\$0\.300\s+2 req/)
   expect((await ui.find({ type: 'Button', key: 'agent:agent-p1' }))?.text).toMatch(/^└ Plan .*\$0\.100\s+1 req/)
   expect(await ui.find({ type: 'Text', text: /saved before session-cost 0\.7\.0/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the compare command refuses to set a session against itself', async ($, on) => {
+  const { state } = engine(on, { 'session:aaaa1111': SOLO, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect((await runCommand($, 'compare aaaa1111 "solo opus run"')).text).toMatch(/both name session aaaa1111; pick two different sessions/)
+  expect(state.open).toBe(false)
+})
+
+test('a session without breakdowns says so under Totals too, where its wall clock and request time are n/a', async ($, on) => {
+  const { rollup: _, ...legacy } = SOLO
+  engine(on, { 'session:aaaa1111': legacy, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await runCommand($, 'compare aaaa bbbb')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Totals, By kind, By model and By subagent each carry the note.
+  expect(await ui.findAll({ type: 'Text', text: /^n\/a for A: / })).toHaveLength(4)
+  await ui.unmount()
+})
+
+test('a subagent\'s details add up: its own line and its subagents make its total', async ($, on) => {
+  const { state } = engine(on)
+  const { explore, plan } = await nestedSession($)
+  state.id = 'sess-2'
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:sess-1' })
+  await ui.press({ key: `agent:${explore}` })
+  // The total counts Explore and the Plan it spawned; Explore's own line and Plan's make it up.
+  expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$0\.0080.*2 req/)
+  expect((await ui.find({ type: 'Text', text: /^Explore own / }))?.text).toMatch(/\$0\.0040\s+1 req/)
+  expect((await ui.find({ type: 'Button', key: `agent:${plan}` }))?.text).toMatch(/^└ Plan .*\$0\.0040\s+1 req/)
+  expect(await requestSeqs(ui)).toEqual(['#2', '#3'])
+  await ui.unmount()
+})
+
+test('a subagent whose parent the rollup lacks, or whose parents loop, is listed under main, and the lines add up', async ($, on) => {
+  const odd = {
+    ...TEAM,
+    rollup: {
+      ...TEAM.rollup,
+      byAgent: {
+        'agent-orphan': { ...bucket(1, 0.05), type: 'Explore', parentId: 'agent-gone' },
+        'agent-loop1': { ...bucket(1, 0.05), type: 'Explore', parentId: 'agent-loop2' },
+        'agent-loop2': { ...bucket(1, 0.1), type: 'Plan', parentId: 'agent-loop1' },
+      },
+    },
+  }
+  engine(on, { 'session:bbbb2222': odd })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:bbbb2222' })
+  expect((await ui.find({ type: 'Text', text: /^main / }))?.text).toMatch(/\$0\.300\s+2 req/)
+  expect((await ui.find({ type: 'Button', key: 'agent:agent-orphan' }))?.text).toMatch(/^└ Explore /)
+  // The loop is broken at one of its agents, which hangs off main with the other under it.
+  const loop = [(await ui.find({ type: 'Button', key: 'agent:agent-loop1' }))?.text, (await ui.find({ type: 'Button', key: 'agent:agent-loop2' }))?.text]
+  expect(loop.filter(t => /^└ /.test(t ?? ''))).toHaveLength(1)
+  expect(loop.filter(t => /^ {2}└ /.test(t ?? ''))).toHaveLength(1)
+  expect(await ui.find({ type: 'Text', text: /^unattributed / })).toBeUndefined()
   await ui.unmount()
 })
