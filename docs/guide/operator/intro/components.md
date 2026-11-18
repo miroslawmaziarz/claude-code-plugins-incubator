@@ -90,14 +90,16 @@ Each hook exits at once when its option is off. Every hook fails open: if `memor
 
 | Component | File | Role |
 |---|---|---|
-| Module | `hooks/hooks.json`, `hooks/register.tsx` | A mod: records each request on `turn.step` and `session.compact`, reads the `/cost` ledger, saves history, registers `/session-cost`, draws the pane, chip and status line |
+| Module | `hooks/hooks.json`, `hooks/register.tsx` | A mod: records each request on `turn.step` and `session.compact`, reads the `/cost` ledger, saves history, registers `/session-cost`, draws the pane, chip and status line; also hooks `agent.spawn` and `prompt.submit` and reads the transcript's title rows |
 | Ledger | `hooks/ledger.ts` | Totals, the 1000-row cap, and splitting a `/cost` increase across overlapping requests |
 | Days | `hooks/days.ts` | Local calendar-day buckets, backfill for older state, history windows |
 | Version | `hooks/version.ts` | Reads the `version` out of a `plugin.json` text, for the pane's header |
 | Cache TTL | `hooks/ttl.ts` | Finds a request in the session's transcript file and reads how much of its cache write was a 1-hour write. Used only with the `cacheTtlSplit` option |
 | Stats | `hooks/stats.ts` | The usage profile behind the Stats tab: cost breakdown, idle gaps, request durations. Used only with the `stats` option |
+| Names | `hooks/names.ts` | Title rows out of the transcript, and the session's name |
+| Rollup, compare, drill | `hooks/rollup.ts`, `hooks/compare.ts`, `hooks/drill.ts` | Per-session breakdowns by kind, model and subagent; the Compare view's metrics; the details view's subagent tree and kept request rows |
 | Prices | `hooks/pricing.ts`, `hooks/format.ts` | The list-price table and the estimate; number, dollar and time formatting |
-| State contract | `types/index.d.ts` | `requests`, `totals`, `ledger`, `view`, `days`, `stats` |
+| State contract | `types/index.d.ts` | `requests`, `totals`, `ledger`, `view`, `days`, `stats`, `names`, `rollup`, `compare`, `drill` |
 | Tests | `hooks/*.test.ts(x)` | Run with `claude plugin test plugins/session-cost` |
 | Icon | `.claude-plugin/icon.png` | The 1024×1024 plugin directory listing icon, also drawn on the landing page |
 
