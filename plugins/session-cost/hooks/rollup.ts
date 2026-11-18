@@ -1,4 +1,4 @@
-import type { AgentRollup, RequestRow, RollupBucket, SessionRollup } from '../types'
+import type { AgentMeta, AgentRollup, RequestRow, RollupBucket, SessionRollup } from '../types'
 import type { Share } from './ledger'
 
 /** The type label of a subagent the mod never saw spawned (one started before it loaded). */
@@ -24,22 +24,51 @@ export function rollupRequests(r: SessionRollup): number {
   return r.byKind.main.requests + r.byKind.subagent.requests + r.byKind.compact.requests
 }
 
-function plusRow<T extends RollupBucket>(b: T, row: RequestRow): T {
+/** `a` with `b` added (`sign` 1) or taken away (`sign` -1), field by field; any other field of `a` kept. */
+function combine<T extends RollupBucket>(a: T, b: RollupBucket, sign: 1 | -1): T {
   return {
-    ...b,
-    input: b.input + row.input,
-    output: b.output + row.output,
-    cacheRead: b.cacheRead + row.cacheRead,
-    cacheWrite: b.cacheWrite + row.cacheWrite,
-    requests: b.requests + 1,
-    estUsd: b.estUsd + (row.estUsd ?? 0),
-    ledgerUsd: b.ledgerUsd + (row.ledgerUsd ?? 0),
-    durationMs: b.durationMs + row.durationMs,
+    ...a,
+    input: a.input + sign * b.input,
+    output: a.output + sign * b.output,
+    cacheRead: a.cacheRead + sign * b.cacheRead,
+    cacheWrite: a.cacheWrite + sign * b.cacheWrite,
+    requests: a.requests + sign * b.requests,
+    estUsd: a.estUsd + sign * b.estUsd,
+    ledgerUsd: a.ledgerUsd + sign * b.ledgerUsd,
+    durationMs: a.durationMs + sign * b.durationMs,
   }
 }
 
+/** Two buckets summed; any other field of `a` (an agent's type) kept. */
+export function addBuckets<T extends RollupBucket>(a: T, b: RollupBucket): T {
+  return combine(a, b, 1)
+}
+
+/** `b` taken from `a`; any other field of `a` kept. */
+export function subtractBuckets<T extends RollupBucket>(a: T, b: RollupBucket): T {
+  return combine(a, b, -1)
+}
+
+/** One request as a bucket of its own. */
+function rowBucket(row: RequestRow): RollupBucket {
+  return {
+    input: row.input,
+    output: row.output,
+    cacheRead: row.cacheRead,
+    cacheWrite: row.cacheWrite,
+    requests: 1,
+    estUsd: row.estUsd ?? 0,
+    ledgerUsd: row.ledgerUsd ?? 0,
+    durationMs: row.durationMs,
+  }
+}
+
+function plusRow<T extends RollupBucket>(b: T, row: RequestRow): T {
+  return addBuckets(b, rowBucket(row))
+}
+
 function plusUsd<T extends RollupBucket>(b: T, usd: number): T {
-  return { ...b, ledgerUsd: b.ledgerUsd + usd }
+  return addBuckets(b, { ...emptyBucket(), ledgerUsd: usd })
 }
 
 /** An agent's entry, made with an unknown type when the rollup has none yet. */
@@ -48,7 +77,7 @@ function agentOf(r: SessionRollup, id: string): AgentRollup {
 }
 
 /** Notes what a subagent was spawned as, keeping what it already counted. */
-export function setAgentMeta(r: SessionRollup, id: string, meta: { type: string; parentId?: string }): SessionRollup {
+export function setAgentMeta(r: SessionRollup, id: string, meta: AgentMeta): SessionRollup {
   const a = agentOf(r, id)
   return {
     ...r,

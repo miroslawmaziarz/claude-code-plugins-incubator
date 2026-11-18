@@ -21,6 +21,11 @@ export function usd(x: number | null): string {
   return `$${x.toFixed(2)}`
 }
 
+/** A session's or agent's id as rows show it: its first 8 characters. */
+export function shortId(id: string): string {
+  return id.slice(0, 8)
+}
+
 /** `claude-opus-5-5-20260101` → `opus-5-5`. */
 export function shortModel(model: string): string {
   const id = normalizeModel(model)
