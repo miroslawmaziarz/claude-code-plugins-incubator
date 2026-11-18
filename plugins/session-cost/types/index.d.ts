@@ -70,7 +70,7 @@ export type Ledger = {
   resetUsd?: number
 }
 
-export type CostView = 'requests' | 'models' | 'history' | 'days' | 'compare'
+export type CostView = 'requests' | 'models' | 'history' | 'days' | 'compare' | 'session'
 
 /** What one calendar day (local time) of a session spent; a request counts on the day its response ended. */
 export type DayTotals = Tokens & {
@@ -98,6 +98,20 @@ export type SessionSummary = Tokens & {
   name?: string
   /** The session's breakdowns; absent on summaries saved before 0.6.0, or when its rows no longer add up to its totals. */
   rollup?: SessionRollup
+  /** Its newest requests (at most 200), oldest first, for the details view; absent on summaries saved before 0.7.0. */
+  rows?: SavedRequest[]
+}
+
+/** A request as history keeps it: its numbers, with no turn id, stop reason, effort or tool names. */
+export type SavedRequest = Tokens &
+  Pick<RequestRow, 'seq' | 'at' | 'durationMs' | 'kind' | 'model' | 'estUsd' | 'ledgerUsd' | 'isApprox'> & {
+    agentId?: string
+  }
+
+/** The session the details view shows, and the subagent within it: `path` runs from the main loop's child down to it. */
+export type DrillTarget = {
+  id: string
+  path: string[]
 }
 
 /** One slice of a session's requests, summed. */
@@ -161,6 +175,7 @@ declare module 'claude-code' {
       names: SessionNames
       rollup: SessionRollup
       compare: CompareSelection
+      drill: DrillTarget
     }
   }
 }
