@@ -37,7 +37,12 @@ const BAND = {
 function engine(on: On, store: Record<string, unknown> = {}) {
   const state = { usd: 0.5, open: false, id: 'sess-1', stepMs: [] as number[], stepTools: [] as string[][], stepCache: [] as { read: number; write: number }[], now: 1_800_000_000_000 }
   const clock = mock.clock(on, { now: 1_800_000_000_000 })
-  mock.store(on, store)
+  // The plugin's store in memory, which a test reads back as the engine would keep it.
+  const saved: Record<string, unknown> = structuredClone(store)
+  on('store.get', (_, e) => ({ value: saved[e.key] }))
+  on('store.set', (_, e) => { saved[e.key] = structuredClone(e.value); return { value: undefined } })
+  on('store.delete', (_, e) => { delete saved[e.key]; return { value: undefined } })
+  on('store.keys', () => ({ value: Object.keys(saved) }))
   on('command.register', () => ({ value: { command: 'session-cost' } }))
   on('ui.open', () => { state.open = true; return { value: { isPlaced: true } } })
   on('ui.close', () => { state.open = false; return { value: undefined } })
@@ -48,6 +53,10 @@ function engine(on: On, store: Record<string, unknown> = {}) {
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], cost: { usd: state.usd } } as never }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  // A spawned subagent's id names its type, so a test can step as it: `agent-explore-1`.
+  let spawned = 0
+  on('agent.spawn', (_, e) => ({ model: 'claude-haiku-5-5', agentId: `agent-${e.subagentType.toLowerCase()}-${++spawned}` }))
   // The engine's own band beneath the plugin: empty.
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box } = $.ui.resolve(e)
@@ -72,7 +81,7 @@ function engine(on: On, store: Record<string, unknown> = {}) {
       usage: { model: e.agentId ? 'claude-haiku-5-5' : 'claude-opus-5-5', input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: cache.read, cache_creation_input_tokens: cache.write },
     }
   })
-  return { state, clock }
+  return { state, clock, store: saved }
 }
 
 async function step($: Engine, index: number, agentId?: string, effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | number) {
@@ -220,6 +229,172 @@ test('a reset with no request after it leaves nothing in history', async ($, on)
   expect(await ui.find({ type: 'Text', text: /This session/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /sess-1/ })).toBe(undefined)
   await ui.unmount()
+})
+
+const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' } as const })
+const done = ($: Engine) => $.turn.complete({ turnId: 'turn-1', answer: 'done', durationMs: 10, isAborted: false, reason: 'answer' })
+
+/** The Recent sessions row of a saved session, as a later session's History tab shows it. */
+async function recentRow($: Engine, id: string) {
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  const found = await ui.find({ type: 'Text', text: new RegExp(id) })
+  await ui.unmount()
+  return found?.text
+}
+
+test('a session without a title is named in Recent sessions by its first prompt', async ($, on) => {
+  const { state } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('Clone   the incubator\nrepo please'))
+  await step($, 0)
+  await done($)
+  await $.prompt.submit(typed('and now something else'))
+  await step($, 1)
+  await done($)
+
+  state.id = 'sess-2'
+  expect(await recentRow($, 'sess-1')).toMatch(/2 req sess-1\s+Clone the incubator repo please$/)
+})
+
+/** A transcript the test writes to, read by the mod as the engine's file system would. */
+function transcript(on: On) {
+  const dir = '/home/u/.claude/projects/p/'
+  const files: Record<string, string> = { [`${dir}sess-1.jsonl`]: '' }
+  const file = { path: `${dir}sess-1.jsonl` }
+  on('session.info', () => ({ value: { transcriptPath: file.path } }))
+  on('fs.stat', (_, e) => (files[e.path] !== undefined ? { value: { kind: 'file', size: files[e.path]!.length, mtimeMs: 0, isLink: false } } : { deny: 'ENOENT' }))
+  on('fs.read', (_, e) => {
+    const text = files[e.path]
+    if (text === undefined) return { deny: 'ENOENT' }
+    const from = e.offset ?? 0
+    return { value: text.slice(from, e.length === undefined ? undefined : from + e.length) }
+  })
+  /** Appends a row to the session's transcript (`id`'s, else the current one). */
+  const append = (row: object, id?: string) => {
+    const path = id === undefined ? file.path : `${dir}${id}.jsonl`
+    files[path] = (files[path] ?? '') + JSON.stringify(row) + '\n'
+  }
+  /** Points the session's transcript at `id`'s file, as a /clear does. */
+  const switchTo = (id: string) => {
+    file.path = `${dir}${id}.jsonl`
+    files[file.path] ??= ''
+  }
+  return { file, append, switchTo }
+}
+
+test('after /clear the ended session keeps the titles of its own transcript, and the next one reads its file from the start', async ($, on) => {
+  const { state } = engine(on)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  const { append, switchTo } = transcript(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('first prompt'))
+  await step($, 0)
+  append({ type: 'ai-title', aiTitle: 'Old title' })
+  await done($)
+  // Renamed after its last turn; by the time session.end runs, the transcript path names the new conversation's file.
+  append({ type: 'custom-title', customTitle: 'Renamed old' })
+  append({ type: 'ai-title', aiTitle: 'New title' }, 'sess-2')
+  switchTo('sess-2')
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+
+  state.id = 'sess-2'
+  await $.prompt.submit(typed('second prompt'))
+  await step($, 1)
+  await done($)
+
+  state.id = 'sess-3'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+Renamed old$/)
+  expect(await recentRow($, 'sess-2')).toMatch(/sess-2\s+New title$/)
+})
+
+test('a reset forgets the session\'s name too, so the saved entry does not bring it back', async ($, on) => {
+  const { state, store } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('before the reset'))
+  await step($, 0)
+  await done($)
+  await runCommand($, 'reset')
+  await step($, 1)
+  await done($)
+  expect((store['session:sess-1'] as { name?: string }).name).toBeUndefined()
+
+  await $.prompt.submit(typed('after the reset'))
+  await done($)
+  state.id = 'sess-2'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+after the reset$/)
+})
+
+test('names in Recent sessions start in one column, a long one cut short, and a session with none shows its id alone', async ($, on) => {
+  const saved = { startedAt: 0, ledgerUsd: 1, estUsd: 1, requests: 5, input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }
+  const now = 1_800_000_000_000
+  engine(on, {
+    'session:a': { ...saved, lastAt: now - 3000, name: 'Short' },
+    'session:0123456789abcdef': { ...saved, lastAt: now - 2000 },
+    'session:old-one': { ...saved, lastAt: now - 1000 },
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  // The id takes 8 cells, padded or cut, then two spaces before the name.
+  expect((await ui.find({ type: 'Text', text: /Short$/ }))?.text).toMatch(/5 req a {9}Short$/)
+  expect((await ui.find({ type: 'Text', text: /old-one/ }))?.text).toMatch(/5 req old-one$/)
+  expect((await ui.find({ type: 'Text', text: /01234567/ }))?.text).toMatch(/5 req 01234567$/)
+  await ui.unmount()
+})
+
+test('after /clear the next conversation is named by its own first prompt, and only the person\'s prompts name one', async ($, on) => {
+  const { state } = engine(on)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'a message from a peer', wait: false, origin: { kind: 'peer', from: 'x' } as never })
+  await $.prompt.submit(typed('First conversation'))
+  await step($, 0)
+  await done($)
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+
+  state.id = 'sess-2'
+  await $.prompt.submit(typed('Second conversation'))
+  await step($, 1)
+  await done($)
+
+  state.id = 'sess-3'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+First conversation$/)
+  expect(await recentRow($, 'sess-2')).toMatch(/sess-2\s+Second conversation$/)
+})
+
+test('a long first prompt is kept cut short, ending in an ellipsis', async ($, on) => {
+  const { state } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed(`Explain ${'very '.repeat(30)}carefully`))
+  await step($, 0)
+  await done($)
+  state.id = 'sess-2'
+  const name = (await recentRow($, 'sess-1'))?.replace(/^.*? req sess-1\s+/, '') ?? ''
+  expect(name).toMatch(/^Explain very very .*…$/)
+  expect(name.length).toBe(60)
+})
+
+test('a title from the transcript names the session over its first prompt, a custom one over an AI one', async ($, on) => {
+  const { state } = engine(on)
+  const { append } = transcript(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  append({ type: 'user', message: { role: 'user', content: 'Clone the incubator repo' }, sessionId: 'sess-1' })
+  await $.prompt.submit(typed('Clone the incubator repo'))
+  await step($, 0)
+  append({ type: 'ai-title', aiTitle: 'Cloning the incubator', sessionId: 'sess-1' })
+  await done($)
+  state.id = 'sess-2'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+Cloning the incubator$/)
+
+  state.id = 'sess-1'
+  append({ type: 'custom-title', customTitle: 'incubator', sessionId: 'sess-1' })
+  append({ type: 'ai-title', aiTitle: 'Cloning and testing the incubator', sessionId: 'sess-1' })
+  await step($, 1)
+  await done($)
+  state.id = 'sess-2'
+  expect(await recentRow($, 'sess-1')).toMatch(/sess-1\s+incubator$/)
 })
 
 /** Local time on a January 2027 day, after the mocked clock's start in any time zone. */
@@ -485,5 +660,399 @@ test('with stats on, the Stats tab profiles cost, cache TTL, idle gaps and reque
   expect((await run($, 'reset')).text).toMatch(/cleared/)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /Stats gather from the next request/ })).toBeDefined()
+  await ui.unmount()
+})
+
+/** Dollars to a tenth of a cent, so sums of ledger shares compare exactly. */
+const cents = (x: number) => Math.round(x * 1000) / 1000
+
+/** Starts a subagent of `type` the way the model's Agent call would, and answers its id. */
+async function spawn($: Engine, type: string, parentAgentId?: string): Promise<string> {
+  const r = await $.agent.spawn({
+    ...(parentAgentId === undefined ? {} : { parentAgentId }),
+    prompt: 'go',
+    description: 'task',
+    subagentType: type,
+    tool_use_id: 'toolu_1',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork: false,
+  })
+  return r.agentId ?? ''
+}
+
+test('a session keeps a rollup in its saved history: by kind, by model and by subagent with its type', async ($, on) => {
+  const { state, store } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  state.stepMs.push(1000, 2000, 3000)
+  await step($, 0)
+  const explore = await spawn($, 'Explore')
+  await step($, 1, explore)
+  await step($, 2)
+  await done($)
+
+  const saved = store['session:sess-1'] as Record<string, any>
+  const r = saved.rollup
+  expect(r.byKind.main.requests).toBe(2)
+  expect(r.byKind.subagent.requests).toBe(1)
+  expect(r.byKind.compact.requests).toBe(0)
+  expect(cents(r.byKind.main.ledgerUsd)).toBe(0.04)
+  expect(cents(r.byKind.subagent.ledgerUsd)).toBe(0.004)
+  expect(r.byModel['claude-haiku-5-5'].requests).toBe(1)
+  expect(r.byModel['claude-opus-5-5'].output).toBe(600)
+  expect(r.byAgent[explore]).toMatchObject({ type: 'Explore', requests: 1, input: 1200, durationMs: 2000 })
+  expect(cents(r.byAgent[explore].ledgerUsd)).toBe(0.004)
+  // Wall clock runs from the first request's start to the last one's end; request time is their sum.
+  expect(r.lastAt - r.firstAt).toBe(6000)
+  expect(r.durationMs).toBe(6000)
+  // Kept request rows carry no turn ids.
+  expect(JSON.stringify(saved)).not.toContain('turnId')
+})
+
+const NOW = 1_800_000_000_000
+const bucket = (requests: number, usd: number, input = 1000 * requests, durationMs = 2000 * requests) => ({
+  input,
+  output: 100 * requests,
+  cacheRead: 0,
+  cacheWrite: 0,
+  requests,
+  estUsd: usd,
+  ledgerUsd: usd,
+  durationMs,
+})
+const NONE = bucket(0, 0)
+
+/** One agent doing the whole task on Opus: 4 main requests, $1.00, 10 minutes. */
+const SOLO = {
+  startedAt: NOW - 3_600_000, lastAt: NOW - 3_000_000, ledgerUsd: 1, estUsd: 1, requests: 4, input: 4000, output: 400, cacheRead: 4000, cacheWrite: 4000, name: 'solo opus run',
+  rollup: {
+    firstAt: NOW - 3_600_000, lastAt: NOW - 3_000_000, durationMs: 8000,
+    byKind: { main: bucket(4, 1), subagent: NONE, compact: NONE },
+    byModel: { 'claude-opus-5-5': bucket(4, 1) },
+    byAgent: {},
+  },
+}
+
+/** The same task split across subagents: 2 main, 2 Explore and 1 Plan requests, $0.50, 5 minutes. */
+const TEAM = {
+  startedAt: NOW - 2_000_000, lastAt: NOW - 1_700_000, ledgerUsd: 0.5, estUsd: 0.5, requests: 5, input: 5000, output: 500, cacheRead: 16000, cacheWrite: 4000, name: 'team sonnet run',
+  rollup: {
+    firstAt: NOW - 2_000_000, lastAt: NOW - 1_700_000, durationMs: 10000,
+    byKind: { main: bucket(2, 0.3), subagent: bucket(3, 0.2), compact: NONE },
+    byModel: { 'claude-sonnet-5-5': bucket(2, 0.3), 'claude-haiku-5-5': bucket(3, 0.2) },
+    byAgent: {
+      'agent-e1': { ...bucket(1, 0.05), type: 'Explore' },
+      'agent-e2': { ...bucket(1, 0.05), type: 'Explore' },
+      'agent-p1': { ...bucket(1, 0.1), type: 'Plan' },
+    },
+  },
+}
+
+const runCommand = ($: Engine, args: string) =>
+  $.command.run({ command: 'session-cost', args, origin: { kind: 'unclassified' }, presentation: { isFullscreen: true, columns: 160 } })
+
+type Mounted = { find: (q: { type: 'Text'; text?: RegExp }) => Promise<{ text?: string; children: unknown[] } | undefined> }
+
+/** A metric row of the Compare view, by its label: its whole text and the color of its B−A and % cells. */
+async function metric(ui: Mounted, label: string) {
+  const row = await ui.find({ type: 'Text', text: new RegExp(`^${label.replace(/[$/.]/g, '\\$&')}\\s`) })
+  const cells = (row?.children ?? []).filter((c): c is Node => typeof c === 'object' && c !== null)
+  return { text: row?.text, color: cells.at(-1)?.props?.color }
+}
+
+test('the compare command sets two saved sessions side by side by name, with B−A and % on every metric', async ($, on) => {
+  const { state } = engine(on, { 'session:aaaa1111': SOLO, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect((await runCommand($, 'compare solo "team sonnet run"')).text).toMatch(/compare view/)
+  expect(state.open).toBe(true)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /^A / }))?.text).toMatch(/aaaa1111.*solo opus run/)
+    expect((await ui.find({ type: 'Text', text: /^B / }))?.text).toMatch(/bbbb2222.*team sonnet run/)
+    // Cheaper is better: green.
+    expect(await metric(ui, '/cost')).toEqual({ text: expect.stringMatching(/\$1\.000\s+\$0\.500\s+-\$0\.500\s+-50%$/), color: 'success' })
+    // More requests is worse: red.
+    expect(await metric(ui, 'requests')).toEqual({ text: expect.stringMatching(/4\s+5\s+\+1\s+\+25%$/), color: 'error' })
+    // A higher cache hit rate is better: 4000/12000 → 16000/25000.
+    expect(await metric(ui, 'cache hit rate')).toEqual({ text: expect.stringMatching(/33%\s+64%\s+\+31pp\s+\+92%$/), color: 'success' })
+    expect(await metric(ui, 'wall clock')).toEqual({ text: expect.stringMatching(/10m 00s\s+5m 00s\s+-5m 00s\s+-50%$/), color: 'success' })
+    expect((await metric(ui, 'request time')).text).toMatch(/8\.0s\s+10\.0s\s+\+2\.0s\s+\+25%$/)
+    // The single-agent run has no subagent side at all.
+    expect((await metric(ui, 'sub req')).text).toMatch(/^sub\s.*\s0\s+3\s+\+3\s+—$/)
+    expect((await metric(ui, 'main $')).text).toMatch(/\$1\.000\s+\$0\.300\s+-\$0\.700\s+-70%$/)
+    expect((await metric(ui, 'opus-5-5 req')).text).toMatch(/opus-5-5.*\s4\s+0\s+-4\s+-100%$/)
+    expect((await metric(ui, 'haiku-5-5 req')).text).toMatch(/haiku-5-5.*\s0\s+3\s+\+3\s+—$/)
+    // Subagents by type.
+    expect((await metric(ui, 'sub:Explore req')).text).toMatch(/^sub:Explore.*\s0\s+2\s+\+2\s+—$/)
+    expect((await metric(ui, 'sub:Plan $')).text).toMatch(/^sub:Plan.*\$0\s+\$0\.100\s+\+\$0\.100\s+—$/)
+    await ui.unmount()
+  }
+})
+
+test('marking a Recent sessions row A and then another B opens the comparison, and swap flips baseline and deltas', async ($, on) => {
+  engine(on, { 'session:aaaa1111': SOLO, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const empty = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await empty.press({ key: 'view:compare' })
+  expect(await empty.find({ type: 'Text', text: /^—$/ })).toBeDefined()
+  await empty.unmount()
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    // Marking A starts a new pair, whatever was compared before.
+    await ui.press({ key: 'view:history' })
+    await ui.press({ key: 'pick:aaaa1111' })
+    expect((await ui.find({ type: 'Button', key: 'pick:aaaa1111' }))?.text).toBe('A')
+    expect(await ui.find({ type: 'Text', text: /^Recent sessions/ })).toBeDefined()
+    await ui.press({ key: 'pick:bbbb2222' })
+    expect((await ui.find({ type: 'Text', text: /^A / }))?.text).toMatch(/aaaa1111/)
+    expect((await ui.find({ type: 'Text', text: /^B / }))?.text).toMatch(/bbbb2222/)
+
+    await ui.press({ key: 'compare:swap' })
+    expect((await ui.find({ type: 'Text', text: /^A / }))?.text).toMatch(/bbbb2222/)
+    expect(await metric(ui, '/cost')).toEqual({ text: expect.stringMatching(/\$0\.500\s+\$1\.000\s+\+\$0\.500\s+\+100%$/), color: 'error' })
+    expect((await metric(ui, 'sub req')).text).toMatch(/3\s+0\s+-3\s+-100%$/)
+    await ui.unmount()
+  }
+})
+
+test('a session saved before rollups compares on totals, with n/a breakdowns and a note', async ($, on) => {
+  const { rollup: _, ...legacy } = SOLO
+  engine(on, { 'session:aaaa1111': legacy, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await runCommand($, 'compare aaaa bbbb')
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await metric(ui, '/cost')).text).toMatch(/\$1\.000\s+\$0\.500\s+-\$0\.500\s+-50%$/)
+    expect(await metric(ui, 'wall clock')).toEqual({ text: expect.stringMatching(/n\/a\s+5m 00s\s+n\/a\s+n\/a$/), color: undefined })
+    expect((await metric(ui, 'sub req')).text).toMatch(/n\/a\s+3\s+n\/a\s+n\/a$/)
+    expect((await metric(ui, 'sub:Explore req')).text).toMatch(/n\/a\s+2\s+n\/a\s+n\/a$/)
+    expect(await ui.find({ type: 'Text', text: /n\/a for A: saved before session-cost 0\.7\.0/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('the compare command says which name it could not place, and compares this session live', async ($, on) => {
+  engine(on, { 'session:aaaa1111': SOLO, 'session:aaaa2222': { ...TEAM, name: 'another solo run' } })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect((await runCommand($, 'compare nothing-like-it aaaa1111')).text).toMatch(/no saved session matches "nothing-like-it"/)
+  expect((await runCommand($, 'compare aaaa aaaa1111')).text).toMatch(/"aaaa" matches 2 sessions/)
+  expect((await runCommand($, 'compare solo')).text).toMatch(/Usage: \/session-cost compare <A> <B>/)
+
+  await $.prompt.submit(typed('the live one'))
+  await step($, 0)
+  expect((await runCommand($, 'compare "solo opus run" sess-1')).text).toMatch(/compare view/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^B / }))?.text).toMatch(/sess-1.*the live one/)
+  expect((await metric(ui, 'requests')).text).toMatch(/4\s+1\s+-3\s+-75%$/)
+  // This session can be marked in History too.
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'pick:sess-1' })
+  await ui.press({ key: 'pick:aaaa1111' })
+  expect((await ui.find({ type: 'Text', text: /^A / }))?.text).toMatch(/sess-1/)
+  await ui.unmount()
+})
+
+test('rollups are pruned with the per-day history they belong to', async ($, on) => {
+  const day = 24 * 60 * 60 * 1000
+  const old = { ...SOLO, lastAt: NOW - 40 * day, days: { '2020-01-01': { input: 1, output: 1, cacheRead: 1, cacheWrite: 1, requests: 4, estUsd: 1, ledgerUsd: 1, otherUsd: 0 } } }
+  const { store } = engine(on, { 'session:aaaa1111': old, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await done($)
+  expect(store['session:aaaa1111']).toBeUndefined()
+  expect((store['session:bbbb2222'] as typeof TEAM).rollup.byKind.subagent.requests).toBe(3)
+})
+
+/** A session with a subagent that spawned its own: main, Explore, Plan inside Explore, main again. */
+async function nestedSession($: Engine) {
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit(typed('nested run'))
+  await step($, 0)
+  const explore = await spawn($, 'Explore')
+  await step($, 1, explore)
+  const plan = await spawn($, 'Plan', explore)
+  await step($, 2, plan)
+  await step($, 3)
+  await done($)
+  return { explore, plan }
+}
+
+/** The request rows of the details view, by their `#seq`. */
+async function requestSeqs(ui: { findAll: (q: { type: 'Text'; text?: RegExp }) => Promise<{ text?: string }[]> }) {
+  return (await ui.findAll({ type: 'Text', text: /^#\d+ / })).map(t => (t.text ?? '').split(' ')[0])
+}
+
+test('a past session opens from History with its summary, every request and its subagent tree', async ($, on) => {
+  const { state } = engine(on)
+  const { explore, plan } = await nestedSession($)
+  state.id = 'sess-2'
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'view:history' })
+    await ui.press({ key: 'open:sess-1' })
+    expect((await ui.find({ type: 'Text', text: /^Session sess-1/ }))?.text).toMatch(/nested run/)
+    // The summary: the same /cost total Recent sessions shows (with the $0.50 spent before the mod loaded), requests, tokens and cache hit rate.
+    expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$0\.548.*4 req/)
+    expect(await ui.find({ type: 'Text', text: /cache hit 93%/ })).toBeDefined()
+    // The tree: main's own requests, Explore, and Plan nested under Explore; with what no request took, they add up to the total.
+    expect((await ui.find({ type: 'Text', text: /^main / }))?.text).toMatch(/\$0\.040\s+2 req/)
+    expect((await ui.find({ type: 'Text', text: /^unattributed / }))?.text).toMatch(/\$0\.500$/)
+    expect((await ui.find({ type: 'Button', key: `agent:${explore}` }))?.text).toMatch(/^└ Explore .*\$0\.0040\s+1 req/)
+    expect((await ui.find({ type: 'Button', key: `agent:${plan}` }))?.text).toMatch(/^  └ Plan .*\$0\.0040\s+1 req/)
+    // Every request, oldest first.
+    expect(await requestSeqs(ui)).toEqual(['#1', '#2', '#3', '#4'])
+    await ui.unmount()
+  }
+})
+
+test('a subagent opens into its own details, and back walks up to its parent, the session, then History', async ($, on) => {
+  const { state } = engine(on)
+  const { explore, plan } = await nestedSession($)
+  state.id = 'sess-2'
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'view:history' })
+    await ui.press({ key: 'open:sess-1' })
+    await ui.press({ key: `agent:${plan}` })
+    expect((await ui.find({ type: 'Text', text: /^Session sess-1/ }))?.text).toMatch(new RegExp(`› Explore ${explore.slice(0, 8)} › Plan ${plan.slice(0, 8)}$`))
+    expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$0\.0040.*1 req/)
+    expect(await requestSeqs(ui)).toEqual(['#3'])
+
+    await ui.press({ key: 'drill:back' })
+    expect((await ui.find({ type: 'Text', text: /^Session sess-1/ }))?.text).toMatch(/› Explore [^›]*$/)
+    // Its requests and its subagent's, as the session's list holds its subagents' too.
+    expect(await requestSeqs(ui)).toEqual(['#2', '#3'])
+    // Its own subagent is listed, one level under it, and can be entered from here too.
+    expect((await ui.find({ type: 'Button', key: `agent:${plan}` }))?.text).toMatch(/^└ Plan /)
+
+    await ui.press({ key: 'drill:back' })
+    expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/4 req/)
+    await ui.press({ key: 'drill:back' })
+    expect(await ui.find({ type: 'Text', text: /^Recent sessions/ })).toBeDefined()
+    // The compare pick still sits on the row.
+    expect((await ui.find({ type: 'Button', key: 'pick:sess-1' }))?.text).toBe('·')
+    await ui.unmount()
+  }
+})
+
+test('this session opens live from History, its requests from the pane\'s own rows', async ($, on) => {
+  engine(on)
+  await nestedSession($)
+  await step($, 4)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:sess-1' })
+  expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$0\.568.*5 req/)
+  expect(await requestSeqs(ui)).toEqual(['#1', '#2', '#3', '#4', '#5'])
+  await ui.unmount()
+})
+
+test('a saved session keeps its newest 200 requests, without turn ids, stop reasons or tool names, and says what it dropped', async ($, on) => {
+  const { state, store } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  state.stepTools.push(['Bash'])
+  for (let i = 0; i < 205; i++) await step($, i)
+  await done($)
+  const saved = store['session:sess-1'] as { rows: { seq: number }[] }
+  expect(saved.rows).toHaveLength(200)
+  expect(saved.rows[0]?.seq).toBe(6)
+  for (const word of ['turnId', 'stopReason', 'tools', 'Bash']) expect(JSON.stringify(saved)).not.toContain(word)
+
+  state.id = 'sess-2'
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:sess-1' })
+  expect((await requestSeqs(ui))[0]).toBe('#6')
+  expect(await ui.find({ type: 'Text', text: /Showing the newest 200 of 205; older ones were not kept/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a session saved before 0.7.0 opens with its totals and a note in place of its tree and rows', async ($, on) => {
+  const { rollup: _, ...legacy } = SOLO
+  engine(on, { 'session:aaaa1111': legacy, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:aaaa1111' })
+  expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$1\.000.*4 req/)
+  expect(await ui.find({ type: 'Text', text: /No main\/subagent split: saved before session-cost 0\.7\.0/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /No request rows: saved before session-cost 0\.7\.0/ })).toBeDefined()
+
+  // One saved with a rollup but no rows (a fork's 0.6.0) has its tree: subagents the main loop spawned hang one level under it.
+  await ui.press({ key: 'drill:back' })
+  await ui.press({ key: 'open:bbbb2222' })
+  expect((await ui.find({ type: 'Text', text: /^main / }))?.text).toMatch(/\$0\.300\s+2 req/)
+  expect((await ui.find({ type: 'Button', key: 'agent:agent-p1' }))?.text).toMatch(/^└ Plan .*\$0\.100\s+1 req/)
+  expect(await ui.find({ type: 'Text', text: /saved before session-cost 0\.7\.0/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the compare command refuses to set a session against itself', async ($, on) => {
+  const { state } = engine(on, { 'session:aaaa1111': SOLO, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect((await runCommand($, 'compare aaaa1111 "solo opus run"')).text).toMatch(/both name session aaaa1111; pick two different sessions/)
+  expect(state.open).toBe(false)
+})
+
+test('a session without breakdowns says so under Totals too, where its wall clock and request time are n/a', async ($, on) => {
+  const { rollup: _, ...legacy } = SOLO
+  engine(on, { 'session:aaaa1111': legacy, 'session:bbbb2222': TEAM })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await runCommand($, 'compare aaaa bbbb')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Totals, By kind, By model and By subagent each carry the note.
+  expect(await ui.findAll({ type: 'Text', text: /^n\/a for A: / })).toHaveLength(4)
+  await ui.unmount()
+})
+
+test('a subagent\'s details add up: its own line and its subagents make its total', async ($, on) => {
+  const { state } = engine(on)
+  const { explore, plan } = await nestedSession($)
+  state.id = 'sess-2'
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:sess-1' })
+  await ui.press({ key: `agent:${explore}` })
+  // The total counts Explore and the Plan it spawned; Explore's own line and Plan's make it up.
+  expect((await ui.find({ type: 'Text', text: /^total / }))?.text).toMatch(/\$0\.0080.*2 req/)
+  expect((await ui.find({ type: 'Text', text: /^Explore own / }))?.text).toMatch(/\$0\.0040\s+1 req/)
+  expect((await ui.find({ type: 'Button', key: `agent:${plan}` }))?.text).toMatch(/^└ Plan .*\$0\.0040\s+1 req/)
+  expect(await requestSeqs(ui)).toEqual(['#2', '#3'])
+  await ui.unmount()
+})
+
+test('a subagent whose parent the rollup lacks, or whose parents loop, is listed under main, and the lines add up', async ($, on) => {
+  const odd = {
+    ...TEAM,
+    rollup: {
+      ...TEAM.rollup,
+      byAgent: {
+        'agent-orphan': { ...bucket(1, 0.05), type: 'Explore', parentId: 'agent-gone' },
+        'agent-loop1': { ...bucket(1, 0.05), type: 'Explore', parentId: 'agent-loop2' },
+        'agent-loop2': { ...bucket(1, 0.1), type: 'Plan', parentId: 'agent-loop1' },
+      },
+    },
+  }
+  engine(on, { 'session:bbbb2222': odd })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view:history' })
+  await ui.press({ key: 'open:bbbb2222' })
+  expect((await ui.find({ type: 'Text', text: /^main / }))?.text).toMatch(/\$0\.300\s+2 req/)
+  expect((await ui.find({ type: 'Button', key: 'agent:agent-orphan' }))?.text).toMatch(/^└ Explore /)
+  // The loop is broken at one of its agents, which hangs off main with the other under it.
+  const loop = [(await ui.find({ type: 'Button', key: 'agent:agent-loop1' }))?.text, (await ui.find({ type: 'Button', key: 'agent:agent-loop2' }))?.text]
+  expect(loop.filter(t => /^└ /.test(t ?? ''))).toHaveLength(1)
+  expect(loop.filter(t => /^ {2}└ /.test(t ?? ''))).toHaveLength(1)
+  expect(await ui.find({ type: 'Text', text: /^unattributed / })).toBeUndefined()
   await ui.unmount()
 })

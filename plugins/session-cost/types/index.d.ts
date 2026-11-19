@@ -80,8 +80,8 @@ export type Ledger = {
   resetUsd?: number
 }
 
-/** The pane's tab; `days` is a view an older version kept, now shown as History. */
-export type CostView = 'requests' | 'models' | 'history' | 'stats' | 'days'
+/** The pane's tab; `days` is a view an older version kept, now shown as History; `session` is a session's details. */
+export type CostView = 'requests' | 'models' | 'history' | 'stats' | 'days' | 'compare' | 'session'
 
 /** Estimated USD of one bucket of a request's tokens. */
 export type CostParts = {
@@ -157,6 +157,79 @@ export type SessionSummary = Tokens & {
   requests: number
   /** The session split by day; absent on summaries saved before days were kept. */
   days?: DayMap
+  /** What Recent sessions calls it: its title, else its first prompt; absent when it had neither, or was saved before 0.7.0. */
+  name?: string
+  /** The session's breakdowns; absent on summaries saved before 0.7.0, or when its rows no longer add up to its totals. */
+  rollup?: SessionRollup
+  /** Its newest requests (at most 200), oldest first, for the details view; absent on summaries saved before 0.7.0. */
+  rows?: SavedRequest[]
+}
+
+/** A request as history keeps it: its numbers, with no turn id, stop reason, effort or tool names. */
+export type SavedRequest = Tokens &
+  Pick<RequestRow, 'seq' | 'at' | 'durationMs' | 'kind' | 'model' | 'estUsd' | 'ledgerUsd' | 'isApprox'> & {
+    agentId?: string
+  }
+
+/** The session the details view shows, and the subagent within it: `path` runs from the main loop's child down to it. */
+export type DrillTarget = {
+  id: string
+  path: string[]
+}
+
+/** One slice of a session's requests, summed. */
+export type RollupBucket = Tokens & {
+  requests: number
+  /** Price-table estimate in USD (requests of unpriced models count 0). */
+  estUsd: number
+  /** Ledger shares of its requests in USD. */
+  ledgerUsd: number
+  /** Summed request time. */
+  durationMs: number
+}
+
+/** What a subagent was spawned as. */
+export type AgentMeta = {
+  /** Its agent type (`Explore`, `Plan`, ...); `subagent` when the mod did not see it spawned. */
+  type: string
+  /** The agent that spawned it; absent when the main loop did. */
+  parentId?: string
+}
+
+/** One subagent's own requests (not its subagents'), with what it was spawned as. */
+export type AgentRollup = RollupBucket & AgentMeta
+
+/** A session's aggregates, kept for comparing and drilling into it after it ends; no per-request rows. */
+export type SessionRollup = {
+  /** When its first request started and its last one ended, in `$.clock.now()` milliseconds. */
+  firstAt: number
+  lastAt: number
+  /** Summed request time. */
+  durationMs: number
+  byKind: Record<RequestKind, RollupBucket>
+  byModel: Record<string, RollupBucket>
+  /** Keyed by the agent id its loop's events carry. */
+  byAgent: Record<string, AgentRollup>
+}
+
+/** The two sessions the Compare view sets side by side, by id; A is the baseline. */
+export type CompareSelection = {
+  a?: string
+  b?: string
+}
+
+/** What the session is called, as far as the mod has seen. */
+export type SessionNames = {
+  /** The first prompt the person sent, on one line and cut short. */
+  prompt?: string
+  /** The last title set with `/rename`, as the transcript has it. */
+  custom?: string
+  /** The last title Claude Code generated for the session, as the transcript has it. */
+  ai?: string
+  /** The transcript file the titles were read from; `scanned` counts its bytes. */
+  transcript?: string
+  /** How many bytes of that transcript have been scanned for titles. */
+  scanned?: number
 }
 
 declare module 'claude-code' {
@@ -168,6 +241,10 @@ declare module 'claude-code' {
       view: CostView
       days: DayMap
       stats: SessionStats
+      names: SessionNames
+      rollup: SessionRollup
+      compare: CompareSelection
+      drill: DrillTarget
     }
   }
 }
